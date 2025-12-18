@@ -10,27 +10,27 @@
 #include <time.h>
 #include "ppos.h"
 
-task_t prod[3], somador, cons[2] ;
-mqueue_t queueValores, queueRaizes ;
+task_t producer_tasks[3], summer_task, consumer_tasks[2] ;
+mqueue_t values_queue, roots_queue ;
 
 // corpo da thread produtor
-void prodBody (void * saida)
+void producer_body (void * output)
 {
-   int valor ;
+   int value ;
 
    while (1)
    {
       // sorteia um valor inteiro aleatorio
-      valor = random () % 1000 ;
+      value = random () % 1000 ;
 
       // envia o valor inteiro na fila de saida
-      if (mqueue_send (&queueValores, &valor) < 0)
+      if (mqueue_send (&values_queue, &value) < 0)
       {
          printf ("T%d terminou\n", task_id()) ;
          task_exit (0) ;
       }
 
-      printf ("T%d enviou %d\n", task_id(), valor) ;
+      printf ("T%d enviou %d\n", task_id(), value) ;
 
       // dorme um intervalo aleatorio
       task_sleep (random () % 3000) ;
@@ -38,29 +38,29 @@ void prodBody (void * saida)
 }
 
 // corpo da thread somador
-void somaBody (void * arg)
+void summer_body (void * arg)
 {
    int v1, v2, v3, i ;
-   double soma, raiz ;
+   double sum, root ;
 
    for (i=0; i<10; i++)
    {
       // recebe tres valores inteiros
-      mqueue_recv (&queueValores, &v1) ;
+      mqueue_recv (&values_queue, &v1) ;
       printf ("               T%d: recebeu %d\n", task_id(), v1) ;
-      mqueue_recv (&queueValores, &v2) ;
+      mqueue_recv (&values_queue, &v2) ;
       printf ("               T%d: recebeu %d\n", task_id(), v2) ;
-      mqueue_recv (&queueValores, &v3) ;
+      mqueue_recv (&values_queue, &v3) ;
       printf ("               T%d: recebeu %d\n", task_id(), v3) ;
 
       // calcula a soma e sua raiz
-      soma = v1 + v2 + v3 ;
-      raiz = sqrt (soma) ;
+      sum = v1 + v2 + v3 ;
+      root = sqrt (sum) ;
       printf ("               T%d: %d+%d+%d = %f (raiz %f)\n",
-              task_id(), v1, v2, v3, soma, raiz) ;
+              task_id(), v1, v2, v3, sum, root) ;
 
       // envia a raiz da soma
-      mqueue_send (&queueRaizes, &raiz) ;
+      mqueue_send (&roots_queue, &root) ;
 
       // dorme um intervalo aleatorio
       task_sleep (random () % 3000) ;
@@ -69,21 +69,21 @@ void somaBody (void * arg)
 }
 
 // corpo da thread consumidor
-void consBody (void * arg)
+void consumer_body (void * arg)
 {
-   double valor ;
+   double value ;
 
    while(1)
    {
       // recebe um valor (double)
-      if (mqueue_recv (&queueRaizes, &valor) < 0)
+      if (mqueue_recv (&roots_queue, &value) < 0)
       {
          printf ("                                 T%d terminou\n",
                  task_id()) ;
          task_exit (0) ;
       }
       printf ("                                 T%d consumiu %f\n",
-              task_id(), valor) ;
+              task_id(), value) ;
 
       // dorme um intervalo aleatorio
       task_sleep (random () % 3000) ;
@@ -97,25 +97,25 @@ int main (int argc, char *argv[])
    ppos_init () ;
 
    // cria as filas de mensagens (5 valores cada)
-   mqueue_create (&queueValores, 5, sizeof(int)) ;
-   mqueue_create (&queueRaizes,  5, sizeof(double)) ;
+   mqueue_create (&values_queue, 5, sizeof(int)) ;
+   mqueue_create (&roots_queue,  5, sizeof(double)) ;
 
    // cria as threads
-   task_create (&somador, somaBody, NULL) ;
-   task_create (&cons[0], consBody, NULL) ;
-   task_create (&cons[1], consBody, NULL) ;
-   task_create (&prod[0], prodBody, NULL) ;
-   task_create (&prod[1], prodBody, NULL) ;
-   task_create (&prod[2], prodBody, NULL) ;
+   task_create (&summer_task, summer_body, NULL) ;
+   task_create (&consumer_tasks[0], consumer_body, NULL) ;
+   task_create (&consumer_tasks[1], consumer_body, NULL) ;
+   task_create (&producer_tasks[0], producer_body, NULL) ;
+   task_create (&producer_tasks[1], producer_body, NULL) ;
+   task_create (&producer_tasks[2], producer_body, NULL) ;
 
    // aguarda o somador encerrar
-   task_join (&somador) ;
+   task_join (&summer_task) ;
 
    // destroi as filas de mensagens
-   printf ("main: destroi queueValores\n") ;
-   mqueue_destroy (&queueValores) ;
-   printf ("main: destroi queueRaizes\n") ;
-   mqueue_destroy (&queueRaizes) ;
+   printf ("main: destroi values_queue\n") ;
+   mqueue_destroy (&values_queue) ;
+   printf ("main: destroi roots_queue\n") ;
+   mqueue_destroy (&roots_queue) ;
 
    // encerra a thread main
    printf ("main: fim\n") ;

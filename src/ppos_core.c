@@ -32,18 +32,18 @@ enum status_t {
 struct sigaction action;              // Estrutura que define um tratador de sinal
 struct itimerval timer;               // Estrutura de inicialização to timer
 
-task_t *currTask = NULL;              // Tarefa atual
-task_t mainTask;                      // Tarefa da main
+task_t *current_task = NULL;          // Tarefa atual
+task_t main_task;                     // Tarefa da main
 
-unsigned int _id = 0;                 // Contador de identificador de tarefas
-unsigned int activeTasks = 0;         // Número de tarefas de usuário ativas
+unsigned int task_id_counter = 0;     // Contador de identificador de tarefas
+unsigned int active_tasks = 0;        // Número de tarefas de usuário ativas
 
 task_t *ready_tasks = NULL;           // Fila de tarefas prontas
-task_t *bed = NULL;
-task_t task_dispatcher;               // Tarefa do despachante
+task_t *sleeping_tasks = NULL;
+task_t dispatcher_task;               // Tarefa do despachante
 
 unsigned int ticks = 0;               // Ticks do relógio
-unsigned int upTime = 0;              // Tempo ativo de cada tarefa
+unsigned int uptime = 0;              // Tempo ativo de cada tarefa
 
 int lock = 0;
 
@@ -53,13 +53,13 @@ int lock = 0;
 
 /* ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ */
 
-static void dispatcher();    // Despachante
-static task_t *scheduler();  // Agendador de prioridade
-static void big_bang();      // Definição do relógio do sistema
-static void chronos();       // Controlador de quantum
-static void rooster();       // Acordador de tarefas dormentes
-void enter_cs (int *lock);   // Entra na zona crítica
-void leave_cs (int *lock);   // Sai da zona crítica
+static void dispatcher_body();              // Despachante
+static task_t *priority_scheduler();       // Agendador de prioridade
+static void setup_system_clock();           // Definição do relógio do sistema
+static void quantum_controller();           // Controlador de quantum
+static void wakeup_sleeping_tasks();        // Acordador de tarefas dormentes
+void enter_cs (int *lock);                  // Entra na zona crítica
+void leave_cs (int *lock);                  // Sai da zona crítica
 
 /* ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ */
 /* +++++++++++++++++++ Início das funções sobre tarefas  ++++++++++++++++++ */
@@ -68,29 +68,29 @@ void leave_cs (int *lock);   // Sai da zona crítica
 void ppos_init() {
 
     // Criando a main task
-    task_create(&mainTask, NULL, NULL);
+    task_create(&main_task, NULL, NULL);
 
     // Atual é a main
-    currTask = &mainTask;
+    current_task = &main_task;
     
     // Criando o despachante
-    task_create(&task_dispatcher, dispatcher, NULL);
+    task_create(&dispatcher_task, dispatcher_body, NULL);
 
     // Ajustes pós-criação genérica
-    task_dispatcher.status = RUNNING;
-    task_dispatcher.preemptable = 0;
-    if (queue_remove((queue_t **)&ready_tasks, (queue_t *)&task_dispatcher) < 0) {
+    dispatcher_task.status = RUNNING;
+    dispatcher_task.preemptable = 0;
+    if (queue_remove((queue_t **)&ready_tasks, (queue_t *)&dispatcher_task) < 0) {
     
         fprintf(stderr, "Erro ao remover dispatcher da lista, abortando.\n");
         exit(ERROR_QUEUE);
     }
-    --activeTasks;
+    --active_tasks;
 
     /* desativa o buffer da saida padrao (stdout), usado pela função printf */
     setvbuf(stdout, 0, _IONBF, 0);
 
     // Definindo o relógio
-    big_bang();
+    setup_system_clock();
 
     // Emtregando o controle ao dispatcher
     task_yield();
@@ -98,26 +98,26 @@ void ppos_init() {
 
 /* ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ */
 
-static void rooster() {
+static void wakeup_sleeping_tasks() {
     
     // Se temos tasks dormindo
-    if (bed) {
+    if (sleeping_tasks) {
 
         // Olhamos para o primeiro da filta
-        task_t *rooster = bed; 
+        task_t *waker = sleeping_tasks; 
 
         // Pegamos o tamanho da fila
-        int napping = queue_size( (queue_t *) bed );
+        int sleeping_tasks_count = queue_size( (queue_t *) sleeping_tasks );
 
         // Varremos a fila acordando as tarefas dormentes
-        for (int i = 0; i < napping; i++) {
+        for (int i = 0; i < sleeping_tasks_count; i++) {
 
-            rooster = rooster->next;
-            if (rooster->alarm <= systime()) { // Se é hora de acordar
+            waker = waker->next;
+            if (waker->alarm <= systime()) { // Se é hora de acordar
 
                 // Acorda
-                task_resume(rooster, &bed);  
-                rooster = bed;
+                task_resume(waker, &sleeping_tasks);  
+                waker = sleeping_tasks;
             } 
         }
     }
@@ -125,18 +125,18 @@ static void rooster() {
 
 /* ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ */
 
-static void dispatcher () {
+static void dispatcher_body () {
 
     task_t *next_task = NULL;
 
     // Enquanto houverem tarefas de usuário
-    while ( activeTasks ) {
+    while ( active_tasks ) {
 
         // O galo acorda tarefas
-        rooster();
+        wakeup_sleeping_tasks();
 
         // Escolhe a próxima tarefa a executar
-        next_task = scheduler();
+        next_task = priority_scheduler();
 
         // Escalonador escolheu uma tarefa?      
         if (next_task) {
@@ -158,7 +158,7 @@ static void dispatcher () {
                 case FINISHED:
 
                     // Removemos a tarefa terminada da fila e ajustamos o número total de tarefas ativas
-                    --activeTasks;
+                    --active_tasks;
                     free(next_task->context.uc_stack.ss_sp);
                     if ( queue_remove( (queue_t **) &ready_tasks, (queue_t *)next_task ) < 0 ) {
 
@@ -183,12 +183,12 @@ static void dispatcher () {
 
 /* ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ */
 
-static task_t *scheduler() {
+static task_t *priority_scheduler() {
 
     if (!ready_tasks) return NULL;
 
     // A tarefa com menos drip é a prioritária
-    task_t *dripless = ready_tasks;
+    task_t *highest_prio_task = ready_tasks;
     task_t *aux = ready_tasks;
 
     // Percorremos a lista de tarefas
@@ -197,8 +197,8 @@ static task_t *scheduler() {
         aux = aux->next;
 
         // A tarefa com menor drip é escolhida
-        if (aux->di_drip < dripless->di_drip)
-            dripless = aux;
+        if (aux->dynamic_prio < highest_prio_task->dynamic_prio)
+            highest_prio_task = aux;
 
     } while (aux != ready_tasks);
 
@@ -206,44 +206,44 @@ static task_t *scheduler() {
     do {
         
         // Aging
-        aux->st_drip += ALPHA;
+        aux->static_prio += ALPHA;
         aux = aux->next;
 
     } while (aux != ready_tasks);
 
     // Resetamos o drip dinâmico da tarefa escolhida
-    dripless->di_drip = dripless->st_drip;
+    highest_prio_task->dynamic_prio = highest_prio_task->static_prio;
 
-    return dripless;
+    return highest_prio_task;
 }
 
 /* ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ */
 
-static void chronos() {
+static void quantum_controller() {
 
     ticks++;
 
-    if (!currTask->preemptable) {
+    if (!current_task->preemptable) {
         return;
     }
 
-    if (currTask->quantum > 0) {
+    if (current_task->quantum > 0) {
     
-        --currTask->quantum;
+        --current_task->quantum;
     }
     else {
     
-        currTask->status = READY;
-        task_switch(&task_dispatcher);
+        current_task->status = READY;
+        task_switch(&dispatcher_task);
     }
 }
 
 /* ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ */
 
-static void big_bang() {
+static void setup_system_clock() {
 
     // Registra a ação para o sinal de timer SIGALRM
-    action.sa_handler = chronos;
+    action.sa_handler = quantum_controller;
     sigemptyset(&action.sa_mask);
     action.sa_flags = 0;
     if (sigaction(SIGALRM, &action, 0) < 0) {
@@ -274,15 +274,15 @@ int task_create(task_t *task, void (*start_func)(void *), void *arg) {
     task->next = NULL;
     task->preemptable = 1;
     task->status = READY;
-    task->id = _id++;
-    task->st_drip = 0;
-    task->di_drip = 0;
+    task->id = task_id_counter++;
+    task->static_prio = 0;
+    task->dynamic_prio = 0;
     task->quantum = QUANTUM;
-    task->exeTime = systime();
-    task->procTime = 0;
-    task->activs = 0;
+    task->exec_time = systime();
+    task->proc_time = 0;
+    task->activations = 0;
     task->exit_code = -1;
-    task->sus_tasks = NULL;
+    task->suspended_tasks = NULL;
     task->alarm = 0;
 
     // Alocamos uma pilha para a task
@@ -313,7 +313,7 @@ int task_create(task_t *task, void (*start_func)(void *), void *arg) {
         fprintf(stderr, "Erro ao inserir elemento %d na lista, abortando.\n", task->id);
         exit(ERROR_QUEUE);
     }
-    activeTasks += 1;
+    active_tasks += 1;
 
     return task->id;
 }
@@ -322,19 +322,19 @@ int task_create(task_t *task, void (*start_func)(void *), void *arg) {
 
 int task_switch(task_t *task) {
 
-    if (currTask->status != FINISHED) {
-        currTask->procTime += (systime() - upTime);
+    if (current_task->status != FINISHED) {
+        current_task->proc_time += (systime() - uptime);
     }
 
-    upTime = systime();
+    uptime = systime();
 
     // A task atual precisa ser guardada antes de ser reatribuída
-    ucontext_t *oldTask = &currTask->context;
-    currTask = task;
-    currTask->status = RUNNING;
+    ucontext_t *old_task_context = &current_task->context;
+    current_task = task;
+    current_task->status = RUNNING;
 
-    task->activs++;
-    swapcontext(oldTask, &task->context);
+    task->activations++;
+    swapcontext(old_task_context, &task->context);
 
     return 0;
 }
@@ -344,26 +344,26 @@ int task_switch(task_t *task) {
 void task_exit(int exit_code) {
 
     // Status da tarefa agora é terminada
-    currTask->status = FINISHED;
+    current_task->status = FINISHED;
 
-    currTask->procTime += (systime() - upTime);
-    currTask->exeTime = (systime() - currTask->exeTime);
-    currTask->exit_code = exit_code;
+    current_task->proc_time += (systime() - uptime);
+    current_task->exec_time = (systime() - current_task->exec_time);
+    current_task->exit_code = exit_code;
 
     printf("Task %d exit: execution time %d ms, processor time %d ms, %d activations\n", 
-    currTask->id, currTask->exeTime, currTask->procTime, currTask->activs);
+    current_task->id, current_task->exec_time, current_task->proc_time, current_task->activations);
 
-    task_t* sus_task = currTask->sus_tasks;
+    task_t* suspended_task = current_task->suspended_tasks;
 
-    while ( sus_task ) {
-        task_resume(sus_task, &currTask->sus_tasks);
-        sus_task = currTask->sus_tasks;
+    while ( suspended_task ) {
+        task_resume(suspended_task, &current_task->suspended_tasks);
+        suspended_task = current_task->suspended_tasks;
     }
 
     // Se a tarefa atual não é o despachante, passa a ser
-    if (currTask != &task_dispatcher) {
+    if (current_task != &dispatcher_task) {
     
-        task_switch(&task_dispatcher);
+        task_switch(&dispatcher_task);
     }
     else {
         exit(0);
@@ -373,14 +373,14 @@ void task_exit(int exit_code) {
 /* ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ */
 
 int task_id() { 
-    return currTask->id;
+    return current_task->id;
 }
 
 /* ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ */
 
 void task_yield() { 
 
-    task_switch(&task_dispatcher);
+    task_switch(&dispatcher_task);
 }
 
 /* ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ */
@@ -391,13 +391,13 @@ void task_setprio(task_t *task, int prio) {
     // precisamos atribuir o dinâmico também
     if (!task) {
     
-        currTask->di_drip = prio;
-        currTask->st_drip = prio;
+        current_task->dynamic_prio = prio;
+        current_task->static_prio = prio;
         return;
     }
 
-    task->di_drip = prio;
-    task->st_drip = prio;
+    task->dynamic_prio = prio;
+    task->static_prio = prio;
 }
 
 /* ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ */
@@ -405,9 +405,9 @@ void task_setprio(task_t *task, int prio) {
 int task_getprio(task_t *task) {
 
     if (!task) {
-        return currTask->st_drip;
+        return current_task->static_prio;
     }
-    return task->st_drip;
+    return task->static_prio;
 }
 
 /* ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ */
@@ -420,14 +420,14 @@ unsigned int systime () {
 
 void task_suspend (task_t **queue) {
 
-    if ( queue_remove((queue_t **)&ready_tasks, (queue_t *)currTask) < 0 ) {
+    if ( queue_remove((queue_t **)&ready_tasks, (queue_t *)current_task) < 0 ) {
 
         fprintf(stderr, "Erro ao remover tarefa na fila %p, abortando.\n", queue);
         exit(ERROR_QUEUE);
     }
 
-    currTask->status = ASLEEP;
-    if (queue_append((queue_t **)queue, (queue_t *)currTask) < 0) {
+    current_task->status = ASLEEP;
+    if (queue_append((queue_t **)queue, (queue_t *)current_task) < 0) {
     
         fprintf(stderr, "Erro ao adicionar tarefa na fila %p, abortando.\n", queue);
         exit(ERROR_QUEUE);
@@ -464,7 +464,7 @@ int task_join (task_t *task) {
 
     if (!task || task->status == FINISHED) return -1;
 
-    task_suspend(&task->sus_tasks);
+    task_suspend(&task->suspended_tasks);
 
     return task->exit_code;
 }
@@ -472,8 +472,8 @@ int task_join (task_t *task) {
 /* ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ */
 
 void task_sleep (int t) {
-    currTask->alarm = systime() + t;
-    task_suspend(&bed);
+    current_task->alarm = systime() + t;
+    task_suspend(&sleeping_tasks);
     task_yield();
 }
 /* ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ */
@@ -489,8 +489,8 @@ void task_sleep (int t) {
 int sem_create (semaphore_t *s, int value) {
 
     s->counter = value;
-    s->jam = NULL;
-    s->lit = 1;
+    s->queue = NULL;
+    s->alive = 1;
 
     return 0;
 }
@@ -499,7 +499,7 @@ int sem_create (semaphore_t *s, int value) {
 
 int sem_down (semaphore_t *s) {
     enter_cs(&lock);
-    if (!s->lit) {
+    if (!s->alive) {
         leave_cs(&lock);
         return -1;
     }
@@ -508,7 +508,7 @@ int sem_down (semaphore_t *s) {
 
     if (s->counter < 0) {
         leave_cs(&lock);
-        task_suspend(&s->jam);
+        task_suspend(&s->queue);
         return 0;
     }
     leave_cs(&lock);
@@ -520,7 +520,7 @@ int sem_down (semaphore_t *s) {
 
 int sem_up (semaphore_t *s) {
     enter_cs(&lock);
-    if (!s->lit) {
+    if (!s->alive) {
         leave_cs(&lock);
         return -1;
     }
@@ -528,8 +528,8 @@ int sem_up (semaphore_t *s) {
     s->counter = s->counter + 1;
 
     if (s->counter <= 0) {
-        task_t* task = s->jam;
-        task_resume(task, &s->jam);
+        task_t* task = s->queue;
+        task_resume(task, &s->queue);
         leave_cs(&lock);
         return 0;
     }   
@@ -542,15 +542,15 @@ int sem_up (semaphore_t *s) {
 
 int sem_destroy (semaphore_t *s) {
     enter_cs(&lock);
-    if (!s->lit) {
+    if (!s->alive) {
         return -1;
     }
 
-    while (s->jam) {
-        task_resume(s->jam, &s->jam);
+    while (s->queue) {
+        task_resume(s->queue, &s->queue);
     }
     
-    s->lit = 0;
+    s->alive = 0;
     s = NULL;
 
     leave_cs(&lock);
@@ -584,9 +584,9 @@ void leave_cs (int *lock) {
 int mqueue_create (mqueue_t *queue, int max_msgs, int msg_size) {
     if (!queue) return -1;
 
-    sem_create(&queue->buffSem, 1);
-    sem_create(&queue->recvSem, 0);
-    sem_create(&queue->sendSem, max_msgs);
+    sem_create(&queue->buff_sem, 1);
+    sem_create(&queue->recv_sem, 0);
+    sem_create(&queue->send_sem, max_msgs);
 
     queue->size = msg_size;
     queue->buffer = NULL;
@@ -599,9 +599,9 @@ int mqueue_create (mqueue_t *queue, int max_msgs, int msg_size) {
 int mqueue_send (mqueue_t *queue, void *msg) {
     if (!queue || !msg) return -1;
 
-    if(sem_down(&queue->sendSem) < 0)
+    if(sem_down(&queue->send_sem) < 0)
         return -1;
-    if(sem_down(&queue->buffSem) < 0)
+    if(sem_down(&queue->buff_sem) < 0)
         return -1;
 
     buffer_t* elem = malloc(sizeof(buffer_t));
@@ -615,9 +615,9 @@ int mqueue_send (mqueue_t *queue, void *msg) {
         exit(ERROR_QUEUE);
     }
 
-    if (sem_up(&queue->buffSem) < 0)
+    if (sem_up(&queue->buff_sem) < 0)
         return -1;
-    if (sem_up(&queue->recvSem) < 0)
+    if (sem_up(&queue->recv_sem) < 0)
         return -1;
 
     return 0;
@@ -628,9 +628,9 @@ int mqueue_send (mqueue_t *queue, void *msg) {
 int mqueue_recv (mqueue_t *queue, void *msg) {
     if (!queue || !msg) return -1;
 
-    if(sem_down(&queue->recvSem)<0)
+    if(sem_down(&queue->recv_sem)<0)
         return -1;
-    if(sem_down(&queue->buffSem)<0)
+    if(sem_down(&queue->buff_sem)<0)
         return -1;
 
     bcopy(&queue->buffer->value, msg, queue->size);
@@ -639,9 +639,9 @@ int mqueue_recv (mqueue_t *queue, void *msg) {
         exit(ERROR_QUEUE);
     }
 
-    if (sem_up(&queue->buffSem) < 0)
+    if (sem_up(&queue->buff_sem) < 0)
         return -1;
-    if (sem_up(&queue->sendSem) < 0)
+    if (sem_up(&queue->send_sem) < 0)
         return -1;
 
     return 0;
@@ -656,11 +656,11 @@ int mqueue_destroy (mqueue_t *queue) {
         queue_remove((queue_t **) &queue->buffer, (queue_t *) queue->buffer);
     }
     
-    if (sem_destroy(&queue->buffSem) < 0)
+    if (sem_destroy(&queue->buff_sem) < 0)
         return -1;
-    if (sem_destroy(&queue->recvSem) < 0)
+    if (sem_destroy(&queue->recv_sem) < 0)
         return -1;
-    if (sem_destroy(&queue->sendSem) < 0)
+    if (sem_destroy(&queue->send_sem) < 0)
         return -1;
 
     free(queue->buffer);
@@ -674,7 +674,7 @@ int mqueue_msgs (mqueue_t *queue) {
 
     if (!queue) return -1;
     
-    return queue->recvSem.counter;
+    return queue->recv_sem.counter;
 }
 
 /* ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ */

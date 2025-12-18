@@ -19,14 +19,14 @@ typedef struct task_t
   ucontext_t context ;			    // contexto armazenado da tarefa
   short status ;			          // pronta, rodando, suspensa, ...
   short preemptable ;	          // pode ser preemptada?
-  short st_drip ;	              // equivalente a nice em UNIX, estático
-  short di_drip ;               // prioridade dinâmica
+  short static_prio ;	          // equivalente a nice em UNIX, estático
+  short dynamic_prio ;          // prioridade dinâmica
   short quantum ;               // quantum de cada tarefa
-  unsigned int exeTime ;        // tempo de execução
-  unsigned int procTime ;       // tempo de processador
-  unsigned int activs ;         // número de ativações
+  unsigned int exec_time ;      // tempo de execução
+  unsigned int proc_time ;      // tempo de processador
+  unsigned int activations ;    // número de ativações
   unsigned int exit_code ;      // código de saida
-  struct task_t *sus_tasks ;    // fila de tarefas suspensas por esta tarefa
+  struct task_t *suspended_tasks ; // fila de tarefas suspensas por esta tarefa
   unsigned int alarm ;          // tempo que a task deve dormir
   // ... (outros campos serão adicionados mais tarde)
 } task_t ;
@@ -35,8 +35,8 @@ typedef struct task_t
 typedef struct
 {
   int counter;
-  task_t* jam; 
-  int lit;
+  task_t* queue; 
+  int alive;
 } semaphore_t ;
 
 // estrutura que define um mutex
@@ -62,9 +62,9 @@ typedef struct buffer_s
 typedef struct
 {
   int size;
-  semaphore_t sendSem;
-  semaphore_t recvSem;
-  semaphore_t buffSem;
+  semaphore_t send_sem;
+  semaphore_t recv_sem;
+  semaphore_t buff_sem;
   buffer_t* buffer;
 } mqueue_t ;
 
